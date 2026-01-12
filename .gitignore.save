@@ -1,0 +1,38 @@
+# Temp / lock files
+*.lock
+*.~
+*.#
+
+# Logs
+logs/*.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+^T
+
+gysIAISSLIHD
+
+
+
+
+^t^z
+^T^Z
+^X
+^T^Z
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
