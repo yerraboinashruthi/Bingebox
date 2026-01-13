@@ -1,44 +1,121 @@
 import pandas as pd
-from sqlalchemy import create_engine
 import hashlib
-import logging
+from sqlalchemy import create_engine, text
 from datetime import datetime
 import os
+import re
 
-DB_URI = "postgresql+psycopg2://postgres:root@localhost:5432/bronze"
-CSV_FOLDER = "bronze_inputs/"
-LOG_FILE = "logs/bronze_load.log"
+# ------------------------
+# CONFIG
+# ------------------------
+DB_URL = "postgresql+psycopg2://postgres:root@localhost:5432/postgres"
+engine = create_engine(DB_URL)
 
-tables = {
-    "users": "users_raw.csv",
-    "content": "content_raw.csv",
-    "subscriptions": "subscriptions_raw.csv",
-    "payments": "payments_raw.csv",
-    "viewing_logs": "viewing_logs_raw.csv"
+BRONZE_DIR = "bronze_inputs"
+BRONZE_SCHEMA = "bronze"
+AUDIT_SCHEMA = "audit"
+AUDIT_TABLE = "bronze_load_log"
+
+# Mapping CSV files → Bronze table names
+TABLE_MAP = {
+    "users_raw.csv": "users",
+    "content_raw.csv": "content",
+    "subscriptions_raw.csv": "subscriptions",
+    "payments_raw.csv": "payments",
+    "viewing_logs_raw.csv": "viewing_logs"
 }
 
-os.makedirs("logs", exist_ok=True)
+# Dependency-safe load order
+LOAD_ORDER = [
+    "users_raw.csv",
+    "content_raw.csv",
+    "subscriptions_raw.csv",
+    "payments_raw.csv",
+    "viewing_logs_raw.csv"
+]
 
-logging.basicConfig(
-    filename=LOG_FILE,
-    level=logging.INFO,
-    format="%(asctime)s | %(message)s"
-)
+# ------------------------
+# HELPER: sanitize column names
+# ------------------------
+def sanitize_columns(df):
+    df = df.copy()
+    df.columns = [re.sub(r'\s+', '_', col.strip()) for col in df.columns]
+    return df
 
-engine = create_engine(DB_URI)
+# ------------------------
+# HELPER: calculate checksum
+# ------------------------
+def calculate_checksum(file_path):
+    try:
+        with open(file_path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except Exception:
+        return None
 
-for table, csv_file in tables.items():
-    start_time = datetime.now()
-    df = pd.read_csv(CSV_FOLDER + csv_file)
-    rows = len(df)
-    checksum = hashlib.md5(
-        pd.util.hash_pandas_object(df, index=True).values
-    ).hexdigest()
+# ------------------------
+# ENSURE SCHEMAS EXIST
+# ------------------------
+with engine.begin() as conn:
+    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {BRONZE_SCHEMA}"))
+    conn.execute(text(f"CREATE SCHEMA IF NOT EXISTS {AUDIT_SCHEMA}"))
+    conn.execute(text(f"""
+        CREATE TABLE IF NOT EXISTS {AUDIT_SCHEMA}.{AUDIT_TABLE} (
+            table_name TEXT,
+            file_name TEXT,
+            row_count BIGINT,
+            checksum TEXT,
+            status TEXT,
+            load_timestamp TIMESTAMP
+        )
+    """))
 
-    df.to_sql(table, engine, if_exists="replace", index=False)
+# ------------------------
+# LOAD BRONZE TABLES
+# ------------------------
+for file_name in LOAD_ORDER:
+    table_name = TABLE_MAP[file_name]
+    file_path = os.path.join(BRONZE_DIR, file_name)
 
-    logging.info(
-        f"TABLE={table} | ROWS={rows} | CHECKSUM={checksum} | STATUS=SUCCESS | TIME={datetime.now() - start_time}"
-    )
+    if not os.path.exists(file_path):
+        print(f"❌ File not found: {file_path}")
+        continue
 
-    print(f"Loaded {table}: {rows} rows")
+    # Read CSV and sanitize
+    df = sanitize_columns(pd.read_csv(file_path))
+    row_count = len(df)
+    checksum = calculate_checksum(file_path)
+
+    try:
+        with engine.begin() as conn:
+            # Truncate table instead of dropping
+            conn.execute(text(f"TRUNCATE TABLE {BRONZE_SCHEMA}.{table_name} CASCADE"))
+            df.to_sql(
+                table_name,
+                conn,
+                schema=BRONZE_SCHEMA,
+                if_exists="append",
+                index=False
+            )
+
+        # Insert audit log
+        audit_df = pd.DataFrame([{
+            "table_name": f"{BRONZE_SCHEMA}.{table_name}",
+            "file_name": file_name,
+            "row_count": row_count,
+            "checksum": checksum,
+            "status": "success",
+            "load_timestamp": datetime.now()
+        }])
+        with engine.begin() as conn:
+            audit_df.to_sql(
+                AUDIT_TABLE,
+                conn,
+                schema=AUDIT_SCHEMA,
+                if_exists="append",
+                index=False
+            )
+
+        print(f"✅ Loaded {file_name} → {BRONZE_SCHEMA}.{table_name} ({row_count} rows)")
+
+    except Exception as e:
+        print(f"❌ Failed to load {file_name} → {BRONZE_SCHEMA}.{table_name} | Error: {e}")
