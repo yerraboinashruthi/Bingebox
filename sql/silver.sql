@@ -36,7 +36,7 @@ SELECT
     content_id,
     content_type,
     genre,
-    release_date AS release_year,
+    release_date,
     duration_min
 FROM bronze.content
 WHERE content_id IS NOT NULL;
@@ -96,6 +96,7 @@ SELECT
     genre,
     watch_time_m,
     date,
+	completion_flag,
     CASE
         WHEN completion_flag ILIKE 'y%' THEN TRUE
         WHEN completion_flag ILIKE 'n%' THEN FALSE
